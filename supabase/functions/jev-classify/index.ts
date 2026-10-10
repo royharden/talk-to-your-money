@@ -83,9 +83,9 @@ function fallbackRoute(text: string): any {
   return { intent, confidence: 0.5, period: "this_month", category, fallback: true };
 }
 
-async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number }> {
+async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number; error?: string }> {
   const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: "jev-classify" });
-  if (error) return { allowed: true, count: 0 };
+  if (error) return { allowed: false, count: 0, error: "Usage counter unavailable" };
   return { allowed: (data as number) <= DAILY_CAP, count: data as number };
 }
 
@@ -255,6 +255,12 @@ Deno.serve(async (req: Request) => {
 
     if (action === "categorize") {
       const cap = await checkCap(supabase);
+      if (cap.error) {
+        return new Response(
+          JSON.stringify({ error: cap.error }),
+          { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
       if (!cap.allowed) {
         return new Response(
           JSON.stringify({ error: "Demo daily limit reached — Offline demo still works." }),
@@ -368,6 +374,12 @@ Deno.serve(async (req: Request) => {
 
     if (action === "route") {
       const cap = await checkCap(supabase);
+      if (cap.error) {
+        return new Response(
+          JSON.stringify({ error: cap.error }),
+          { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
       if (!cap.allowed) {
         return new Response(
           JSON.stringify({ error: "Demo daily limit reached — Offline demo still works." }),

@@ -39,12 +39,12 @@ function normalizeMerchant(raw: string): string {
   return m || raw.trim().toUpperCase();
 }
 
-/** Check daily cap via service role */
-async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number }> {
+/** Check daily cap via service role. Fails closed: if the counter call errors, deny the request. */
+async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number; error?: string }> {
   const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: "ingest" });
   if (error) {
     console.error("Counter error:", error);
-    return { allowed: true, count: 0 };
+    return { allowed: false, count: 0, error: "Usage counter unavailable" };
   }
   const count = data as number;
   return { allowed: count <= DAILY_CAP, count };
@@ -363,6 +363,12 @@ Deno.serve(async (req: Request) => {
     );
 
     const cap = await checkCap(supabase);
+    if (cap.error) {
+      return new Response(
+        JSON.stringify({ error: cap.error }),
+        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
     if (!cap.allowed) {
       return new Response(
         JSON.stringify({ error: "Demo daily limit reached — Offline demo still works." }),
@@ -371,7 +377,6 @@ Deno.serve(async (req: Request) => {
     }
 
     const contentType = req.headers.get("Content-Type") || "";
-
     let result: any;
 
     // Handle multipart (audio or image upload)

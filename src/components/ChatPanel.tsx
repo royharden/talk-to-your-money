@@ -2,7 +2,7 @@ import { Mic, Send, Sparkles, Receipt as ReceiptIcon } from "lucide-react";
 import { useState, useRef, useCallback, useEffect } from "react";
 import { ChatMessage, Mode, ParsedTransaction } from "@/lib/types";
 import { SAMPLE_QUESTIONS } from "@/lib/demo";
-import { askQuestion, apiParseChat, apiParseVoice, apiParseReceipt, apiCategorize } from "@/lib/api";
+import { askQuestion, apiParseChat, apiParseVoice, apiParseReceipt, apiCategorize, apiUpsertRule } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatDate } from "@/lib/format";
 import { CATEGORY_COLORS } from "@/lib/categories";
@@ -64,10 +64,7 @@ export function ChatPanel({ mode, customCategories, onTransactionsCategorized }:
 
       // Create a rule for confirmed merchant
       if (mode !== "offline") {
-        await supabase.from("rules").upsert({
-          merchant: cat.merchant,
-          category: cat.category,
-        }, { onConflict: "merchant" });
+        await apiUpsertRule(cat.merchant, cat.category);
       }
 
       setMessages((prev) =>

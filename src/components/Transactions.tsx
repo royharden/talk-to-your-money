@@ -5,6 +5,7 @@ import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatDate } from "@/lib/format";
 import { CATEGORIES } from "@/lib/categories";
 import { ConfidenceDot, CategoryChip, SourceIcon } from "@/components/Shared";
+import { apiUpdateTransactionCategory, apiDeleteTransaction, apiDeleteAllData } from "@/lib/api";
 
 export function Transactions({ onChanged }: { onChanged: () => void }) {
   const [txs, setTxs] = useState<Transaction[]>([]);
@@ -44,12 +45,10 @@ export function Transactions({ onChanged }: { onChanged: () => void }) {
   useEffect(() => { load(); }, [load]);
 
   const handleEdit = useCallback(async (tx: Transaction) => {
-    const { error } = await supabase
-      .from("transactions")
-      .update({ category: editCat, needs_review: false, category_source: "user" })
-      .eq("id", tx.id);
-    if (error) {
-      console.error(error);
+    try {
+      await apiUpdateTransactionCategory(tx.id, editCat);
+    } catch (err) {
+      console.error(err);
       return;
     }
     setEditing(null);
@@ -58,9 +57,10 @@ export function Transactions({ onChanged }: { onChanged: () => void }) {
   }, [editCat, load, onChanged]);
 
   const handleDelete = useCallback(async (tx: Transaction) => {
-    const { error } = await supabase.from("transactions").delete().eq("id", tx.id);
-    if (error) {
-      console.error(error);
+    try {
+      await apiDeleteTransaction(tx.id);
+    } catch (err) {
+      console.error(err);
       return;
     }
     load();
@@ -69,12 +69,12 @@ export function Transactions({ onChanged }: { onChanged: () => void }) {
 
   const handleDeleteAll = useCallback(async () => {
     if (!confirm("Delete ALL transactions? This cannot be undone.")) return;
-    const { error } = await supabase.from("transactions").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-    if (error) {
-      console.error(error);
+    try {
+      await apiDeleteAllData();
+    } catch (err) {
+      console.error(err);
       return;
     }
-    await supabase.from("rules").delete().neq("id", "00000000-0000-0000-0000-000000000000");
     load();
     onChanged();
   }, [load, onChanged]);

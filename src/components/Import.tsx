@@ -2,7 +2,7 @@ import { useState, useCallback, useRef } from "react";
 import { Upload, Loader2, CheckCircle, AlertCircle } from "lucide-react";
 import Papa from "papaparse";
 import { ParsedTransaction, Mode } from "@/lib/types";
-import { apiParseCsv, apiParsePdf, apiCategorize } from "@/lib/api";
+import { apiParseCsv, apiParsePdf, apiCategorize, apiUpsertRule } from "@/lib/api";
 import { supabase } from "@/lib/supabase";
 import { formatCurrency, formatDate } from "@/lib/format";
 
@@ -103,10 +103,7 @@ export function Import({ mode, customCategories, onImported }: { mode: Mode; cus
       // Create rules for auto-accepted
       const autoAccepted = allCategorized.filter((tx) => !tx.needs_review && tx.category_source === "jev");
       for (const tx of autoAccepted) {
-        await supabase.from("rules").upsert({
-          merchant: tx.merchant,
-          category: tx.category,
-        }, { onConflict: "merchant" });
+        await apiUpsertRule(tx.merchant, tx.category);
       }
 
       setStats({

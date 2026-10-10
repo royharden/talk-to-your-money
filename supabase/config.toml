@@ -1,8 +1,11 @@
 [functions.ingest]
-verify_jwt = false
+verify_jwt = true
 
 [functions.jev-classify]
-verify_jwt = false
+verify_jwt = true
 
 [functions.answer]
-verify_jwt = false
+verify_jwt = true
+
+[functions.mutate]
+verify_jwt = true

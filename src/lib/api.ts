@@ -17,6 +17,40 @@ async function invokeFn(name: string, body: any): Promise<any> {
   return data;
 }
 
+// ── Mutate API (all UPDATE/DELETE/upsert go through the mutate edge function) ──
+
+export async function apiConfirmCategory(id: string, category: string): Promise<void> {
+  await invokeFn("mutate", { action: "confirm_category", id, category });
+}
+
+export async function apiBulkConfirm(ids: string[]): Promise<void> {
+  await invokeFn("mutate", { action: "bulk_confirm", ids });
+}
+
+export async function apiUpdateTransactionCategory(id: string, category: string): Promise<void> {
+  await invokeFn("mutate", { action: "update_transaction_category", id, category });
+}
+
+export async function apiDeleteTransaction(id: string): Promise<void> {
+  await invokeFn("mutate", { action: "delete_transaction", id });
+}
+
+export async function apiDeleteAllData(): Promise<void> {
+  await invokeFn("mutate", { action: "delete_all_data" });
+}
+
+export async function apiUpsertRule(merchant: string, category: string): Promise<void> {
+  await invokeFn("mutate", { action: "upsert_rule", merchant, category });
+}
+
+export async function apiUpsertBudget(category: string, month: string, amountCents: number): Promise<void> {
+  await invokeFn("mutate", { action: "upsert_budget", category, month, amount_cents: amountCents });
+}
+
+export async function apiDeleteBudget(id: string): Promise<void> {
+  await invokeFn("mutate", { action: "delete_budget", id });
+}
+
 /** Parse chat text into transactions */
 export async function apiParseChat(text: string, mode: Mode): Promise<ParsedTransaction[]> {
   if (mode === "offline") {

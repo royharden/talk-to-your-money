@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { Check, ChevronDown, Inbox, CheckCheck } from "lucide-react";
 import { Transaction } from "@/lib/types";
 import { supabase } from "@/lib/supabase";
+import { apiConfirmCategory, apiBulkConfirm } from "@/lib/api";
 import { formatCurrency, formatDate, formatConfidence } from "@/lib/format";
 import { CATEGORY_COLORS, CATEGORIES } from "@/lib/categories";
 import { ConfidenceDot, CategoryChip } from "@/components/Shared";
@@ -30,21 +31,12 @@ export function NeedsReview({ onReviewed }: { onReviewed: () => void }) {
   useEffect(() => { load(); }, [load]);
 
   const handleConfirm = useCallback(async (tx: Transaction, category: string) => {
-    const { error } = await supabase
-      .from("transactions")
-      .update({ needs_review: false, category, category_source: "user", category_conf: 1.0 })
-      .eq("id", tx.id);
-    if (error) {
-      console.error(error);
+    try {
+      await apiConfirmCategory(tx.id, category);
+    } catch (err) {
+      console.error(err);
       return;
     }
-
-    // Create a rule for this merchant
-    await supabase.from("rules").upsert({
-      merchant: tx.merchant,
-      category,
-    }, { onConflict: "merchant" });
-
     setItems((prev) => prev.filter((t) => t.id !== tx.id));
     onReviewed();
   }, [onReviewed]);
@@ -53,17 +45,12 @@ export function NeedsReview({ onReviewed }: { onReviewed: () => void }) {
     const highConf = items.filter((t) => Number(t.category_conf) >= 0.6);
     if (highConf.length === 0) return;
 
-    for (const tx of highConf) {
-      await supabase
-        .from("transactions")
-        .update({ needs_review: false, category_source: "user" })
-        .eq("id", tx.id);
-      await supabase.from("rules").upsert({
-        merchant: tx.merchant,
-        category: tx.category,
-      }, { onConflict: "merchant" });
+    try {
+      await apiBulkConfirm(highConf.map((t) => t.id));
+    } catch (err) {
+      console.error(err);
+      return;
     }
-
     setItems((prev) => prev.filter((t) => Number(t.category_conf) < 0.6));
     onReviewed();
   }, [items, onReviewed]);

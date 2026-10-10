@@ -4,6 +4,7 @@ import { supabase } from "@/lib/supabase";
 import { Budget } from "@/lib/types";
 import { CATEGORIES, MAX_CUSTOM_CATEGORIES } from "@/lib/categories";
 import { currentMonthISO, formatMonth } from "@/lib/format";
+import { apiUpsertBudget, apiDeleteBudget } from "@/lib/api";
 
 interface BudgetSettingsProps {
   customCategories: string[];
@@ -49,26 +50,21 @@ export function BudgetSettings({ customCategories, onAddCategory, onRemoveCatego
     if (isNaN(value) || value < 0) return;
     const amountCents = Math.round(value * 100);
 
-    const existing = budgets.find((b) => b.category === category);
-    if (existing) {
-      const { error } = await supabase
-        .from("budgets")
-        .update({ amount_cents: amountCents })
-        .eq("id", existing.id);
-      if (error) console.error(error);
-    } else {
-      const { error } = await supabase
-        .from("budgets")
-        .insert({ category, month: currentMonth, amount_cents: amountCents });
-      if (error) console.error(error);
+    try {
+      await apiUpsertBudget(category, currentMonth, amountCents);
+    } catch (err) {
+      console.error(err);
     }
     load();
     onChanged();
-  }, [editValues, budgets, currentMonth, load, onChanged]);
+  }, [editValues, currentMonth, load, onChanged]);
 
   const handleDelete = useCallback(async (budget: Budget) => {
-    const { error } = await supabase.from("budgets").delete().eq("id", budget.id);
-    if (error) console.error(error);
+    try {
+      await apiDeleteBudget(budget.id);
+    } catch (err) {
+      console.error(err);
+    }
     load();
     onChanged();
   }, [load, onChanged]);

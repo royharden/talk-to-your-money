@@ -99,9 +99,9 @@ function validateNumbers(llmAnswer: string, computedResult: any): boolean {
   return true;
 }
 
-async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number }> {
+async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number; error?: string }> {
   const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: "answer" });
-  if (error) return { allowed: true, count: 0 };
+  if (error) return { allowed: false, count: 0, error: "Usage counter unavailable" };
   return { allowed: (data as number) <= DAILY_CAP, count: data as number };
 }
 
@@ -141,6 +141,12 @@ Deno.serve(async (req: Request) => {
 
     // Live LLM mode
     const cap = await checkCap(supabase);
+    if (cap.error) {
+      return new Response(
+        JSON.stringify({ error: cap.error }),
+        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
     if (!cap.allowed) {
       const templateFn = TEMPLATES[intent] || TEMPLATES.unsupported;
       const answer = templateFn(question, computedResult || {});
