@@ -1,0 +1,8 @@
+[functions.ingest]
+verify_jwt = false
+
+[functions.jev-classify]
+verify_jwt = false
+
+[functions.answer]
+verify_jwt = false
