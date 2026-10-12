@@ -1,3 +1,4 @@
+import { FunctionsHttpError } from "@supabase/supabase-js";
 import { supabase } from "./supabase";
 import { Mode, ParsedTransaction } from "./types";
 import { runQuery } from "./queries";
@@ -15,6 +16,18 @@ async function invokeFn(name: string, body: any): Promise<any> {
     throw new Error(data.error);
   }
   return data;
+}
+
+/** Invoke ingest with a multipart body, surfacing the function's own error text */
+async function invokeIngestForm<T>(formData: FormData): Promise<T> {
+  const { data, error } = await supabase.functions.invoke("ingest", { body: formData });
+  if (error instanceof FunctionsHttpError) {
+    const resp: Response = error.context;
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error || `ingest failed (${resp.status})`);
+  }
+  if (error) throw error;
+  return data as T;
 }
 
 // ── Mutate API (all UPDATE/DELETE/upsert go through the mutate edge function) ──
@@ -84,18 +97,7 @@ export async function apiParseVoice(audioBlob: Blob, mode: Mode): Promise<{ tran
   formData.append("audio", audioBlob, "audio.webm");
   formData.append("today", new Date().toISOString().slice(0, 10));
 
-  const resp = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ingest`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-    },
-    body: formData,
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error || `ingest failed (${resp.status})`);
-  }
-  return resp.json();
+  return invokeIngestForm(formData);
 }
 
 /** Parse receipt image */
@@ -107,18 +109,7 @@ export async function apiParseReceipt(imageFile: File, mode: Mode): Promise<{ pa
   formData.append("action", "receipt");
   formData.append("image", imageFile);
 
-  const resp = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/ingest`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-    },
-    body: formData,
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error || `ingest failed (${resp.status})`);
-  }
-  return resp.json();
+  return invokeIngestForm(formData);
 }
 
 /** Categorize transactions via Jev */
@@ -172,6 +163,9 @@ export async function apiRoute(
   });
 }
 
+/** Mirrors the answer function's 20 KB limit on computed results */
+const MAX_ANSWER_RESULT_BYTES = 20 * 1024;
+
 /** Get an answer (LLM or template) */
 export async function apiAnswer(
   question: string,
@@ -179,7 +173,8 @@ export async function apiAnswer(
   computedResult: any,
   mode: Mode
 ): Promise<{ answer: string; highlight_numbers: string[]; suggestion?: string | null; source: string }> {
-  if (mode === "offline" || mode === "mock") {
+  const tooLarge = new TextEncoder().encode(JSON.stringify(computedResult) ?? "").length > MAX_ANSWER_RESULT_BYTES;
+  if (mode === "offline" || mode === "mock" || tooLarge) {
     const templateFn = OFFLINE_TEMPLATES[intent] || OFFLINE_TEMPLATES.unsupported;
     const answer = templateFn(computedResult || {});
     const nums = (answer.match(/-?\$?[\d,]+\.?\d*/g) || []).map((m) => m.replace(/[$,]/g, ""));

@@ -1,6 +1,7 @@
 // ingest Edge Function — normalizes raw input into transactions
 // Handles: chat text, voice (audio transcription), receipt photo (vision), CSV/PDF statement text
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+import { encodeBase64 } from "jsr:@std/encoding@1.0.10/base64";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -8,7 +9,98 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const DAILY_CAP = 200;
+const DEFAULT_DAILY_CAP = 200;
+const DAILY_LIMIT_MESSAGE = "Demo daily limit reached — Offline demo still works.";
+
+// Request bounds (checked before any paid call); 413 when exceeded
+const MAX_BODY_BYTES = 6 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 5 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp"];
+const MAX_CHAT_CHARS = 2000;
+const MAX_CSV_BYTES = 2 * 1024 * 1024;
+const MAX_CSV_LINES = 5000;
+const MAX_PDF_TEXT_BYTES = 500 * 1024;
+const MAX_PDF_LLM_LINES = 50;
+const MAX_PDF_LINE_CHARS = 300;
+
+class HttpError extends Error {
+  constructor(public status: number, message: string, public code?: string) {
+    super(message);
+  }
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+/** Daily cap: the DAILY_CALL_LIMIT secret if it is a positive integer, else 200 */
+function dailyCap(): number {
+  const limit = Number(Deno.env.get("DAILY_CALL_LIMIT"));
+  return Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_DAILY_CAP;
+}
+
+/** Read the request body, rejecting with 413 as soon as it exceeds maxBytes */
+async function readBody(req: Request, maxBytes: number) {
+  if (Number(req.headers.get("Content-Length")) > maxBytes) {
+    throw new HttpError(413, "Request body too large");
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (req.body) {
+    const reader = req.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new HttpError(413, "Request body too large");
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  }
+  return bytes;
+}
+
+function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
+/** Only accept a client date in YYYY-MM-DD form; it is placed in the prompt */
+function cleanDate(value: unknown): string | undefined {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : undefined;
+}
+
+function requireOpenAIKey(): string {
+  const apiKey = Deno.env.get("OPENAI_API_KEY");
+  if (!apiKey) throw new HttpError(500, "No OPENAI_API_KEY configured");
+  return apiKey;
+}
+
+/** Detect the real image format from its first bytes */
+function sniffImageType(bytes: Uint8Array): string | null {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+  if (
+    bytes.length >= 8 &&
+    [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((b, i) => bytes[i] === b)
+  ) return "image/png";
+  if (
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF" &&
+    String.fromCharCode(...bytes.subarray(8, 12)) === "WEBP"
+  ) return "image/webp";
+  return null;
+}
 
 interface ParsedTransaction {
   date: string;
@@ -39,15 +131,34 @@ function normalizeMerchant(raw: string): string {
   return m || raw.trim().toUpperCase();
 }
 
-/** Check daily cap via service role. Fails closed: if the counter call errors, deny the request. */
-async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number; error?: string }> {
-  const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: "ingest" });
+/**
+ * Reserve `units` paid OpenAI calls against the daily cap via the service role.
+ * Fails closed: an RPC error or a null/non-integer result is reported as an
+ * error (503), never as OK.
+ */
+async function checkCap(supabase: any, units: number): Promise<{ allowed: boolean; count: number; error?: string }> {
+  const { data, error } = await supabase.rpc("increment_usage_counter_by", {
+    p_fn: "ingest",
+    p_units: units,
+    p_cap: dailyCap(),
+  });
   if (error) {
     console.error("Counter error:", error);
     return { allowed: false, count: 0, error: "Usage counter unavailable" };
   }
-  const count = data as number;
-  return { allowed: count <= DAILY_CAP, count };
+  if (typeof data !== "number" || !Number.isInteger(data)) {
+    console.error("Counter returned a non-integer:", data);
+    return { allowed: false, count: 0, error: "Usage counter unavailable" };
+  }
+  // -1 means the reservation would exceed the cap and nothing was added
+  return { allowed: data >= units, count: data };
+}
+
+/** Reserve units or throw the 503/429 the client should see */
+async function reserve(supabase: any, units: number): Promise<void> {
+  const cap = await checkCap(supabase, units);
+  if (cap.error) throw new HttpError(503, cap.error);
+  if (!cap.allowed) throw new HttpError(429, DAILY_LIMIT_MESSAGE, "daily_limit");
 }
 
 /** Call OpenAI chat completion for parsing text or vision */
@@ -55,8 +166,7 @@ async function callOpenAI(
   messages: any[],
   options: { jsonMode?: boolean; isVision?: boolean } = {}
 ): Promise<any> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) throw new Error("No OPENAI_API_KEY configured");
+  const apiKey = requireOpenAIKey();
 
   const baseUrl = Deno.env.get("OPENAI_BASE_URL") || "https://api.openai.com/v1";
   const model = Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini";
@@ -75,7 +185,8 @@ async function callOpenAI(
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`OpenAI error ${resp.status}: ${errText}`);
+    console.error(`OpenAI error ${resp.status}:`, errText);
+    throw new HttpError(502, "Upstream service error");
   }
 
   const json = await resp.json();
@@ -128,9 +239,8 @@ async function parseChatText(text: string, userDate?: string): Promise<ParsedTra
 
 /** Transcribe audio via OpenAI Whisper */
 async function transcribeAudio(audioBlob: Blob): Promise<string> {
-  const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) throw new Error("No OPENAI_API_KEY configured");
-  const model = Deno.env.get("OPENAI_TRANSCRIBE_MODEL") || "gpt-4o-mini-transcribe";
+  const apiKey = requireOpenAIKey();
+  const model = Deno.env.get("OPENAI_TRANSCRIBE_MODEL")?.trim() || "gpt-4o-mini-transcribe";
 
   const formData = new FormData();
   formData.append("file", audioBlob, "audio.webm");
@@ -144,7 +254,8 @@ async function transcribeAudio(audioBlob: Blob): Promise<string> {
 
   if (!resp.ok) {
     const errText = await resp.text();
-    throw new Error(`Transcription error ${resp.status}: ${errText}`);
+    console.error(`Transcription error ${resp.status}:`, errText);
+    throw new HttpError(502, "Upstream service error");
   }
 
   const json = await resp.json();
@@ -356,51 +467,50 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-      { auth: { persistSession: false } }
-    );
-
-    const cap = await checkCap(supabase);
-    if (cap.error) {
-      return new Response(
-        JSON.stringify({ error: cap.error }),
-        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set");
+      return jsonResponse({ error: "Usage counter unavailable" }, 503);
     }
-    if (!cap.allowed) {
-      return new Response(
-        JSON.stringify({ error: "Demo daily limit reached — Offline demo still works." }),
-        { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
+    const supabase = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
 
     const contentType = req.headers.get("Content-Type") || "";
+    const rawBody = await readBody(req, MAX_BODY_BYTES);
     let result: any;
 
     // Handle multipart (audio or image upload)
     if (contentType.includes("multipart/form-data")) {
-      const formData = await req.formData();
-      const action = formData.get("action") as string;
+      let formData: FormData;
+      try {
+        formData = await new Response(rawBody, { headers: { "Content-Type": contentType } }).formData();
+      } catch {
+        throw new HttpError(400, "Invalid form data");
+      }
+      const action = formData.get("action");
 
       if (action === "voice") {
-        const audioFile = formData.get("audio") as File;
-        const userDate = (formData.get("today") as string) || undefined;
-        if (!audioFile) throw new Error("No audio file provided");
+        const audioFile = formData.get("audio");
+        const userDate = cleanDate(formData.get("today"));
+        if (!(audioFile instanceof File) || audioFile.size === 0) throw new HttpError(400, "No audio file provided");
+        if (audioFile.size > MAX_AUDIO_BYTES) throw new HttpError(413, "Audio too large (max 5 MB)");
+        requireOpenAIKey();
+        await reserve(supabase, 2); // transcription + parse
         const transcript = await transcribeAudio(audioFile);
-        const parsed = await parseChatText(transcript, userDate);
+        const parsed = await parseChatText(transcript.slice(0, MAX_CHAT_CHARS), userDate);
         result = { type: "voice", transcript, transactions: parsed };
       } else if (action === "receipt") {
-        const imageFile = formData.get("image") as File;
-        if (!imageFile) throw new Error("No image file provided");
-        const arrayBuffer = await imageFile.arrayBuffer();
-        const base64 = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-        const parsed = await parseReceiptImage(base64, imageFile.type);
-        const lineSum = (parsed.line_items || []).reduce(
-          (s: number, li: any) => s + Math.abs(parseFloat(li.price) || 0),
-          0
-        );
+        const imageFile = formData.get("image");
+        if (!(imageFile instanceof File) || imageFile.size === 0) throw new HttpError(400, "No image file provided");
+        if (imageFile.size > MAX_IMAGE_BYTES) throw new HttpError(413, "Image too large (max 4 MB)");
+        const bytes = new Uint8Array(await imageFile.arrayBuffer());
+        const imageType = sniffImageType(bytes);
+        if (!ALLOWED_IMAGE_TYPES.includes(imageFile.type) || !imageType) {
+          throw new HttpError(415, "Unsupported image type (use JPEG, PNG or WebP)");
+        }
+        requireOpenAIKey();
+        await reserve(supabase, 1);
+        const parsed = await parseReceiptImage(encodeBase64(bytes), imageType);
         const txs: ParsedTransaction[] = [];
         if (parsed.merchant && parsed.total) {
           txs.push({
@@ -414,25 +524,45 @@ Deno.serve(async (req: Request) => {
         }
         result = { type: "receipt", parsed, transactions: txs, sum_check: parsed.sum_check };
       } else {
-        throw new Error("Unknown multipart action");
+        throw new HttpError(400, "Unknown multipart action");
       }
     } else {
       // JSON body
-      const body = await req.json();
-      const { type, text, csvText, pdfText, today } = body;
+      let body: any;
+      try {
+        body = JSON.parse(new TextDecoder().decode(rawBody));
+      } catch {
+        throw new HttpError(400, "Invalid JSON body");
+      }
+      if (!body || typeof body !== "object" || Array.isArray(body)) throw new HttpError(400, "Invalid JSON body");
+      const { type, text, csvText, pdfText } = body;
+      const today = cleanDate(body.today);
 
       if (type === "chat") {
-        const parsed = await parseChatText(text || "", today);
+        if (typeof text !== "string" || !text.trim()) throw new HttpError(400, "Missing text");
+        if (text.length > MAX_CHAT_CHARS) throw new HttpError(413, `Text too long (max ${MAX_CHAT_CHARS} characters)`);
+        requireOpenAIKey();
+        await reserve(supabase, 1);
+        const parsed = await parseChatText(text, today);
         result = { type: "chat", transactions: parsed };
       } else if (type === "csv") {
-        const parsed = parseCsvText(csvText || "");
+        const csv = typeof csvText === "string" ? csvText : "";
+        if (byteLength(csv) > MAX_CSV_BYTES) throw new HttpError(413, "CSV too large (max 2 MB)");
+        if (csv.trim().split(/\r?\n/).length > MAX_CSV_LINES) {
+          throw new HttpError(413, `CSV has too many lines (max ${MAX_CSV_LINES})`);
+        }
+        // Parsed in code only — no paid call, so nothing to count
+        const parsed = parseCsvText(csv);
         result = { type: "csv", transactions: parsed };
       } else if (type === "pdf") {
-        const { transactions, unparsed } = parsePdfText(pdfText || "");
+        const pdf = typeof pdfText === "string" ? pdfText : "";
+        if (byteLength(pdf) > MAX_PDF_TEXT_BYTES) throw new HttpError(413, "PDF text too large (max 500 KB)");
+        const { transactions, unparsed } = parsePdfText(pdf);
 
-        // Try LLM for unparsed lines
+        // Try LLM for unparsed lines (the only paid call for a PDF)
         let llmFixed: ParsedTransaction[] = [];
-        if (unparsed.length > 0 && unparsed.length <= 50) {
+        if (unparsed.length > 0 && unparsed.length <= MAX_PDF_LLM_LINES && Deno.env.get("OPENAI_API_KEY")) {
+          await reserve(supabase, 1);
           try {
             const llmResult = await callOpenAI(
               [
@@ -444,7 +574,7 @@ Deno.serve(async (req: Request) => {
                 },
                 {
                   role: "user",
-                  content: unparsed.join("\n"),
+                  content: unparsed.map((line) => line.slice(0, MAX_PDF_LINE_CHARS)).join("\n"),
                 },
               ],
               { jsonMode: true }
@@ -471,23 +601,26 @@ Deno.serve(async (req: Request) => {
         const all = dedupe([...transactions, ...llmFixed]);
         result = { type: "pdf", transactions: all, regex_parsed: transactions.length, llm_parsed: llmFixed.length };
       } else if (type === "voice") {
-        // Voice with base64 audio in JSON
-        const transcript = await transcribeAudio(new Blob([new Uint8Array(body.audioData)]));
-        const parsed = await parseChatText(transcript, today);
+        // Voice with raw audio bytes (array of 0-255) in JSON
+        const { audioData } = body;
+        if (!Array.isArray(audioData) || audioData.length === 0) throw new HttpError(400, "No audio data provided");
+        if (audioData.length > MAX_AUDIO_BYTES) throw new HttpError(413, "Audio too large (max 5 MB)");
+        requireOpenAIKey();
+        await reserve(supabase, 2); // transcription + parse
+        const transcript = await transcribeAudio(new Blob([new Uint8Array(audioData)]));
+        const parsed = await parseChatText(transcript.slice(0, MAX_CHAT_CHARS), today);
         result = { type: "voice", transcript, transactions: parsed };
       } else {
-        throw new Error(`Unknown type: ${type}`);
+        throw new HttpError(400, `Unknown type: ${String(type).slice(0, 40)}`);
       }
     }
 
-    return new Response(JSON.stringify(result), {
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    return jsonResponse(result);
   } catch (err) {
+    if (err instanceof HttpError) {
+      return jsonResponse(err.code ? { error: err.message, code: err.code } : { error: err.message }, err.status);
+    }
     console.error("ingest error:", err);
-    return new Response(
-      JSON.stringify({ error: err.message }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    return jsonResponse({ error: "Internal error" }, 500);
   }
 });

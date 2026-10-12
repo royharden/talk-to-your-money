@@ -9,12 +9,94 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const DAILY_CAP = 200;
+const DEFAULT_DAILY_CAP = 200;
 
+// Request bounds
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_BULK_IDS = 500;
+const MAX_CATEGORY_CHARS = 100;
+const MAX_MERCHANT_CHARS = 500;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+class HttpError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+/** Daily cap: the DAILY_CALL_LIMIT secret if it is a positive integer, else 200 */
+function dailyCap(): number {
+  const limit = Number(Deno.env.get("DAILY_CALL_LIMIT"));
+  return Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_DAILY_CAP;
+}
+
+/** Read the request body, rejecting with 413 as soon as it exceeds maxBytes */
+async function readJsonBody(req: Request, maxBytes: number): Promise<any> {
+  if (Number(req.headers.get("Content-Length")) > maxBytes) {
+    throw new HttpError(413, "Request body too large");
+  }
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  if (req.body) {
+    const reader = req.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new HttpError(413, "Request body too large");
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  }
+  let body: any;
+  try {
+    body = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    throw new HttpError(400, "Invalid JSON body");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "Invalid JSON body");
+  }
+  return body;
+}
+
+function isId(v: unknown): v is string {
+  return typeof v === "string" && UUID_RE.test(v);
+}
+
+function isText(v: unknown, max: number): v is string {
+  return typeof v === "string" && v.length > 0 && v.length <= max;
+}
+
+/**
+ * Count this write against the daily cap. Fails closed: an RPC error or a
+ * null/non-integer result is reported as an error (503), never as OK.
+ */
 async function checkCap(supabase: any): Promise<{ allowed: boolean; count: number; error?: string }> {
-  const { data, error } = await supabase.rpc("increment_usage_counter", { p_fn: "mutate" });
-  if (error) return { allowed: false, count: 0, error: "Usage counter unavailable" };
-  return { allowed: (data as number) <= DAILY_CAP, count: data as number };
+  const { data, error } = await supabase.rpc("increment_usage_counter_by", {
+    p_fn: "mutate",
+    p_units: 1,
+    p_cap: dailyCap(),
+  });
+  if (error) {
+    console.error("Counter error:", error);
+    return { allowed: false, count: 0, error: "Usage counter unavailable" };
+  }
+  if (typeof data !== "number" || !Number.isInteger(data)) {
+    console.error("Counter returned a non-integer:", data);
+    return { allowed: false, count: 0, error: "Usage counter unavailable" };
+  }
+  // -1 means the cap is reached and nothing was added
+  return { allowed: data >= 1, count: data };
 }
 
 function capResponse(cap: { allowed: boolean; error?: string }) {
@@ -26,7 +108,7 @@ function capResponse(cap: { allowed: boolean; error?: string }) {
   }
   if (!cap.allowed) {
     return new Response(
-      JSON.stringify({ error: "Demo daily limit reached — Offline demo still works." }),
+      JSON.stringify({ error: "Demo daily limit reached — Offline demo still works.", code: "daily_limit" }),
       { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
@@ -39,25 +121,30 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const supabase = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-      { auth: { persistSession: false } }
-    );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceRoleKey) {
+      console.error("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is not set");
+      return new Response(
+        JSON.stringify({ error: "Usage counter unavailable" }),
+        { status: 503, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    const supabase = createClient(supabaseUrl, serviceRoleKey, { auth: { persistSession: false } });
+
+    const body = await readJsonBody(req, MAX_BODY_BYTES);
+    const { action } = body;
 
     const cap = await checkCap(supabase);
     const capResp = capResponse(cap);
     if (capResp) return capResp;
-
-    const body = await req.json();
-    const { action } = body;
 
     // --- transactions ---
 
     if (action === "confirm_category") {
       // Confirm a category for a transaction (from Needs Review or inline edit)
       const { id, category } = body;
-      if (!id || !category) throw new Error("Missing id or category");
+      if (!isId(id) || !isText(category, MAX_CATEGORY_CHARS)) throw new HttpError(400, "Missing id or category");
 
       const { data: tx, error: txErr } = await supabase
         .from("transactions")
@@ -65,7 +152,7 @@ Deno.serve(async (req: Request) => {
         .eq("id", id)
         .maybeSingle();
       if (txErr) throw txErr;
-      if (!tx) throw new Error("Transaction not found");
+      if (!tx) throw new HttpError(404, "Transaction not found");
 
       const { error } = await supabase
         .from("transactions")
@@ -87,7 +174,9 @@ Deno.serve(async (req: Request) => {
     if (action === "bulk_confirm") {
       // Bulk-accept items above a confidence threshold
       const { ids } = body;
-      if (!ids || !Array.isArray(ids)) throw new Error("Missing ids array");
+      if (!ids || !Array.isArray(ids)) throw new HttpError(400, "Missing ids array");
+      if (ids.length > MAX_BULK_IDS) throw new HttpError(400, `Too many ids (max ${MAX_BULK_IDS})`);
+      if (!ids.every(isId)) throw new HttpError(400, "Invalid id");
 
       for (const id of ids) {
         const { data: tx } = await supabase
@@ -116,7 +205,7 @@ Deno.serve(async (req: Request) => {
     if (action === "update_transaction_category") {
       // Inline edit from Transactions table
       const { id, category } = body;
-      if (!id || !category) throw new Error("Missing id or category");
+      if (!isId(id) || !isText(category, MAX_CATEGORY_CHARS)) throw new HttpError(400, "Missing id or category");
 
       const { error } = await supabase
         .from("transactions")
@@ -131,7 +220,7 @@ Deno.serve(async (req: Request) => {
 
     if (action === "delete_transaction") {
       const { id } = body;
-      if (!id) throw new Error("Missing id");
+      if (!isId(id)) throw new HttpError(400, "Missing id");
 
       const { error } = await supabase.from("transactions").delete().eq("id", id);
       if (error) throw error;
@@ -142,7 +231,8 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "delete_all_data") {
-      // Wipe all transactions, rules, budgets, receipts, questions
+      // Wipe all transactions, rules, budgets, receipts, questions.
+      // NOTE: open to anyone with the anon key (demo "Delete all my data" button) — left as is pending a decision.
       await supabase.from("receipts").delete().neq("id", "00000000-0000-0000-0000-000000000000");
       await supabase.from("transactions").delete().neq("id", "00000000-0000-0000-0000-000000000000");
       await supabase.from("rules").delete().neq("id", "00000000-0000-0000-0000-000000000000");
@@ -159,7 +249,9 @@ Deno.serve(async (req: Request) => {
     if (action === "upsert_rule") {
       // Create/update a merchant rule (after confirming a chat transaction)
       const { merchant, category } = body;
-      if (!merchant || !category) throw new Error("Missing merchant or category");
+      if (!isText(merchant, MAX_MERCHANT_CHARS) || !isText(category, MAX_CATEGORY_CHARS)) {
+        throw new HttpError(400, "Missing merchant or category");
+      }
 
       const { error } = await supabase.from("rules").upsert(
         { merchant, category },
@@ -176,7 +268,13 @@ Deno.serve(async (req: Request) => {
 
     if (action === "upsert_budget") {
       const { category, month, amount_cents } = body;
-      if (!category || !month || amount_cents === undefined) throw new Error("Missing budget fields");
+      if (
+        !isText(category, MAX_CATEGORY_CHARS) ||
+        typeof month !== "string" || !DATE_RE.test(month) ||
+        !Number.isInteger(amount_cents) || Math.abs(amount_cents) > 2147483647
+      ) {
+        throw new HttpError(400, "Missing budget fields");
+      }
 
       const { data: existing } = await supabase
         .from("budgets")
@@ -205,7 +303,7 @@ Deno.serve(async (req: Request) => {
 
     if (action === "delete_budget") {
       const { id } = body;
-      if (!id) throw new Error("Missing id");
+      if (!isId(id)) throw new HttpError(400, "Missing id");
 
       const { error } = await supabase.from("budgets").delete().eq("id", id);
       if (error) throw error;
@@ -215,11 +313,17 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    throw new Error(`Unknown action: ${action}`);
+    throw new HttpError(400, `Unknown action: ${String(action).slice(0, 40)}`);
   } catch (err) {
+    if (err instanceof HttpError) {
+      return new Response(
+        JSON.stringify({ error: err.message }),
+        { status: err.status, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
     console.error("mutate error:", err);
     return new Response(
-      JSON.stringify({ error: err.message }),
+      JSON.stringify({ error: "Internal error" }),
       { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }

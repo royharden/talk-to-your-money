@@ -39,8 +39,9 @@ flowchart LR
 1. **Numbers come from code only.** The LLM receives computed figures and must not invent or recompute amounts. Code checks that every number in the LLM answer appears in the computed result, and replaces the answer with a template if it doesn't.
 2. **Demo data only.** No bank connections, logins, or account numbers. A "Delete all my data" button wipes everything. Card/account numbers are masked (last 4 kept) before storing or sending to Jev/LLM.
 3. **Untrusted data.** User text, receipts, and statements are wrapped as data in every Jev and LLM call. Instruction-like text is flagged, not obeyed.
-4. **Daily cap:** 200 calls per Edge Function per day via `usage_counters` table. RLS enabled with no anon/authenticated policies — only the service role can write. The increment function is `SECURITY DEFINER` with `REVOKE EXECUTE FROM PUBLIC, anon, authenticated` and `GRANT EXECUTE TO service_role` only.
-5. **Three Edge Functions only:** `ingest`, `jev-classify`, `answer` — each deployed once.
+4. **Daily cap:** 200 paid upstream calls per Edge Function per day (override with the `DAILY_CALL_LIMIT` secret) via the `usage_counters` table. Every Jev/OpenAI call — each categorize batch, each retry, and both voice calls (transcribe + parse) — reserves a unit with `increment_usage_counter_by` before it is made (`mutate` counts each write request). A reservation that would exceed the cap is refused (429, or the template fallback for answers); a counter error or unexpected result fails closed (503). RLS enabled with no anon/authenticated policies — only the service role can write. The counter functions are `SECURITY DEFINER` with `REVOKE EXECUTE FROM PUBLIC, anon, authenticated` and `GRANT EXECUTE TO service_role` only.
+5. **Four Edge Functions:** `ingest`, `jev-classify`, `answer`, and `mutate` (all edits/deletes, via the service role) — all with `verify_jwt = true`.
+6. **Bounded requests:** bodies, item counts and field lengths are capped before any paid call (e.g. 200 transactions per categorize call, 500-char questions, 2,000-char chat text, 5 MB audio, 4 MB JPEG/PNG/WebP receipts, 2 MB / 5,000-line CSVs, 500 KB PDF text). Oversized requests get 413/400.
 
 ### Policy
 - **Auto-accept** if confidence >= 0.75 and not `uncertain`. Otherwise → Needs you queue with top 3 options.
@@ -81,7 +82,8 @@ npm run dev
 | `OPENAI_API_KEY` | Edge Function secret | OpenAI API key for parsing + answers |
 | `OPENAI_MODEL` | Edge Function secret | Model name (default `gpt-4o-mini`) |
 | `OPENAI_BASE_URL` | Edge Function secret | Custom base URL (optional) |
-| `OPENAI_TRANSCRIBE_MODEL` | Edge Function secret | Transcription model (optional) |
+| `OPENAI_TRANSCRIBE_MODEL` | Edge Function secret | Transcription model (optional, default `gpt-4o-mini-transcribe`) |
+| `DAILY_CALL_LIMIT` | Edge Function secret | Paid calls per function per day (optional, default `200`) |
 
 ## Modes
 
@@ -98,7 +100,7 @@ A seeded demo person "Sam" has ~250 transactions across July–September 2026, w
 - Demo data only — no bank connections, logins, or account numbers
 - Simple PDF parsing (regex line extraction first, LLM for unparseable lines)
 - Not financial advice
-- Daily cap of 200 calls per Edge Function
+- Daily cap of 200 paid upstream calls per Edge Function
 
 ## Design decisions
 
