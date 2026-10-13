@@ -11,6 +11,7 @@ import { BudgetSettings } from "@/components/BudgetSettings";
 import { Mode } from "@/lib/types";
 import { CATEGORIES, MAX_CUSTOM_CATEGORIES } from "@/lib/categories";
 import { supabase } from "@/lib/supabase";
+import { ensureSession } from "@/lib/api";
 
 type Tab = "dashboard" | "chat" | "review" | "transactions" | "import" | "stats" | "budgets";
 
@@ -30,6 +31,19 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [customCategories, setCustomCategories] = useState<string[]>([]);
   const [reviewCount, setReviewCount] = useState(0);
+  const [session, setSession] = useState<"loading" | "ready" | "error">("loading");
+  const [sessionError, setSessionError] = useState("");
+
+  // Every read and write is scoped to this browser's workspace, so get one first
+  useEffect(() => {
+    ensureSession()
+      .then(() => setSession("ready"))
+      .catch((err) => {
+        console.error(err);
+        setSessionError(err instanceof Error ? err.message : String(err));
+        setSession("error");
+      });
+  }, []);
 
   const triggerRefresh = useCallback(() => {
     setRefreshKey((k) => k + 1);
@@ -65,6 +79,7 @@ function App() {
 
   // Load review count for badge
   useEffect(() => {
+    if (session !== "ready") return;
     const loadCount = async () => {
       const { count } = await supabase
         .from("transactions")
@@ -75,7 +90,15 @@ function App() {
     loadCount();
     const interval = setInterval(loadCount, 5000);
     return () => clearInterval(interval);
-  }, [refreshKey]);
+  }, [refreshKey, session]);
+
+  if (session !== "ready") {
+    return (
+      <div className="h-screen flex items-center justify-center bg-slate-50 px-4 text-center text-sm text-slate-500">
+        {session === "loading" ? "Setting up your workspace..." : `Couldn't start a session: ${sessionError}`}
+      </div>
+    );
+  }
 
   return (
     <div className="h-screen flex flex-col bg-slate-50">

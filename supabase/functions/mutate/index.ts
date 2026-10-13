@@ -1,12 +1,14 @@
 // mutate Edge Function — all privileged write operations (UPDATE, DELETE, upsert)
 // Uses the service-role client. Counts against the daily cap.
-// The browser anon key can only SELECT and INSERT; all edits/deletes go through here.
+// The browser anon key can only SELECT and INSERT its own rows; all edits/deletes go through here.
+// Every action except create_session is scoped to the caller's workspace, resolved
+// from the unguessable owner token in the x-owner-token header.
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, X-Owner-Token",
 };
 
 const DEFAULT_DAILY_CAP = 200;
@@ -18,6 +20,8 @@ const MAX_CATEGORY_CHARS = 100;
 const MAX_MERCHANT_CHARS = 500;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+// 32 random bytes, base64url without padding
+const OWNER_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
 class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -75,6 +79,33 @@ function isId(v: unknown): v is string {
 
 function isText(v: unknown, max: number): v is string {
   return typeof v === "string" && v.length > 0 && v.length <= max;
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** A new unguessable owner token: 32 random bytes, base64url */
+function newOwnerToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** The caller's workspace id from the x-owner-token header; 401 if missing or unknown */
+async function resolveOwner(supabase: any, req: Request): Promise<string> {
+  const token = req.headers.get("x-owner-token");
+  if (!token || !OWNER_TOKEN_RE.test(token)) {
+    throw new HttpError(401, "Missing or invalid session");
+  }
+  const { data, error } = await supabase
+    .from("workspaces")
+    .select("id")
+    .eq("token_hash", await sha256Hex(token))
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) throw new HttpError(401, "Missing or invalid session");
+  return data.id;
 }
 
 /**
@@ -135,9 +166,25 @@ Deno.serve(async (req: Request) => {
     const body = await readJsonBody(req, MAX_BODY_BYTES);
     const { action } = body;
 
+    // Resolve the caller before spending a unit; only create_session has no owner yet
+    const owner = action === "create_session" ? null : await resolveOwner(supabase, req);
+
     const cap = await checkCap(supabase);
     const capResp = capResponse(cap);
     if (capResp) return capResp;
+
+    // --- session ---
+
+    if (action === "create_session") {
+      // New workspace (seeded with the demo template). Only the token's hash is stored.
+      const token = newOwnerToken();
+      const { error } = await supabase.rpc("create_workspace", { p_token_hash: await sha256Hex(token) });
+      if (error) throw error;
+
+      return new Response(JSON.stringify({ ok: true, token }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
 
     // --- transactions ---
 
@@ -150,6 +197,7 @@ Deno.serve(async (req: Request) => {
         .from("transactions")
         .select("merchant")
         .eq("id", id)
+        .eq("owner_id", owner)
         .maybeSingle();
       if (txErr) throw txErr;
       if (!tx) throw new HttpError(404, "Transaction not found");
@@ -157,13 +205,14 @@ Deno.serve(async (req: Request) => {
       const { error } = await supabase
         .from("transactions")
         .update({ needs_review: false, category, category_source: "user", category_conf: 1.0 })
-        .eq("id", id);
+        .eq("id", id)
+        .eq("owner_id", owner);
       if (error) throw error;
 
       // Create a rule for this merchant
       await supabase.from("rules").upsert(
-        { merchant: tx.merchant, category },
-        { onConflict: "merchant" }
+        { owner_id: owner, merchant: tx.merchant, category },
+        { onConflict: "owner_id,merchant" }
       );
 
       return new Response(JSON.stringify({ ok: true }), {
@@ -183,17 +232,19 @@ Deno.serve(async (req: Request) => {
           .from("transactions")
           .select("merchant, category")
           .eq("id", id)
+          .eq("owner_id", owner)
           .maybeSingle();
         if (!tx) continue;
 
         await supabase
           .from("transactions")
           .update({ needs_review: false, category_source: "user" })
-          .eq("id", id);
+          .eq("id", id)
+          .eq("owner_id", owner);
 
         await supabase.from("rules").upsert(
-          { merchant: tx.merchant, category: tx.category },
-          { onConflict: "merchant" }
+          { owner_id: owner, merchant: tx.merchant, category: tx.category },
+          { onConflict: "owner_id,merchant" }
         );
       }
 
@@ -210,7 +261,8 @@ Deno.serve(async (req: Request) => {
       const { error } = await supabase
         .from("transactions")
         .update({ category, needs_review: false, category_source: "user" })
-        .eq("id", id);
+        .eq("id", id)
+        .eq("owner_id", owner);
       if (error) throw error;
 
       return new Response(JSON.stringify({ ok: true }), {
@@ -222,7 +274,7 @@ Deno.serve(async (req: Request) => {
       const { id } = body;
       if (!isId(id)) throw new HttpError(400, "Missing id");
 
-      const { error } = await supabase.from("transactions").delete().eq("id", id);
+      const { error } = await supabase.from("transactions").delete().eq("id", id).eq("owner_id", owner);
       if (error) throw error;
 
       return new Response(JSON.stringify({ ok: true }), {
@@ -231,13 +283,10 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "delete_all_data") {
-      // Wipe all transactions, rules, budgets, receipts, questions.
-      // NOTE: open to anyone with the anon key (demo "Delete all my data" button) — left as is pending a decision.
-      await supabase.from("receipts").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("transactions").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("rules").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("budgets").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-      await supabase.from("questions").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      // Wipe the caller's transactions, rules, budgets, receipts and questions — nobody else's.
+      // delete_all_data(p_owner) is service-role only and raises on a NULL/unknown owner.
+      const { error } = await supabase.rpc("delete_all_data", { p_owner: owner });
+      if (error) throw error;
 
       return new Response(JSON.stringify({ ok: true }), {
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -254,8 +303,8 @@ Deno.serve(async (req: Request) => {
       }
 
       const { error } = await supabase.from("rules").upsert(
-        { merchant, category },
-        { onConflict: "merchant" }
+        { owner_id: owner, merchant, category },
+        { onConflict: "owner_id,merchant" }
       );
       if (error) throw error;
 
@@ -279,6 +328,7 @@ Deno.serve(async (req: Request) => {
       const { data: existing } = await supabase
         .from("budgets")
         .select("id")
+        .eq("owner_id", owner)
         .eq("category", category)
         .eq("month", month)
         .maybeSingle();
@@ -287,12 +337,13 @@ Deno.serve(async (req: Request) => {
         const { error } = await supabase
           .from("budgets")
           .update({ amount_cents })
-          .eq("id", existing.id);
+          .eq("id", existing.id)
+          .eq("owner_id", owner);
         if (error) throw error;
       } else {
         const { error } = await supabase
           .from("budgets")
-          .insert({ category, month, amount_cents });
+          .insert({ owner_id: owner, category, month, amount_cents });
         if (error) throw error;
       }
 
@@ -305,7 +356,7 @@ Deno.serve(async (req: Request) => {
       const { id } = body;
       if (!isId(id)) throw new HttpError(400, "Missing id");
 
-      const { error } = await supabase.from("budgets").delete().eq("id", id);
+      const { error } = await supabase.from("budgets").delete().eq("id", id).eq("owner_id", owner);
       if (error) throw error;
 
       return new Response(JSON.stringify({ ok: true }), {

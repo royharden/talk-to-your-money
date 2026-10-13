@@ -37,11 +37,12 @@ flowchart LR
 
 ### Hard rules
 1. **Numbers come from code only.** The LLM receives computed figures and must not invent or recompute amounts. Code checks that every number in the LLM answer appears in the computed result, and replaces the answer with a template if it doesn't.
-2. **Demo data only.** No bank connections, logins, or account numbers. A "Delete all my data" button wipes everything. Card/account numbers are masked (last 4 kept) before storing or sending to Jev/LLM.
+2. **Demo data only.** No bank connections, logins, or account numbers. A "Delete all my data" button wipes the visitor's own workspace — never anyone else's. Card/account numbers are masked (last 4 kept) before storing or sending to Jev/LLM.
 3. **Untrusted data.** User text, receipts, and statements are wrapped as data in every Jev and LLM call. Instruction-like text is flagged, not obeyed.
 4. **Daily cap:** 200 paid upstream calls per Edge Function per day (override with the `DAILY_CALL_LIMIT` secret) via the `usage_counters` table. Every Jev/OpenAI call — each categorize batch, each retry, and both voice calls (transcribe + parse) — reserves a unit with `increment_usage_counter_by` before it is made (`mutate` counts each write request). A reservation that would exceed the cap is refused (429, or the template fallback for answers); a counter error or unexpected result fails closed (503). RLS enabled with no anon/authenticated policies — only the service role can write. The counter functions are `SECURITY DEFINER` with `REVOKE EXECUTE FROM PUBLIC, anon, authenticated` and `GRANT EXECUTE TO service_role` only.
 5. **Four Edge Functions:** `ingest`, `jev-classify`, `answer`, and `mutate` (all edits/deletes, via the service role) — all with `verify_jwt = true`.
 6. **Bounded requests:** bodies, item counts and field lengths are capped before any paid call (e.g. 200 transactions per categorize call, 500-char questions, 2,000-char chat text, 5 MB audio, 4 MB JPEG/PNG/WebP receipts, 2 MB / 5,000-line CSVs, 500 KB PDF text). Oversized requests get 413/400.
+7. **Per-visitor workspaces.** On first load `mutate` (`create_session`) mints an unguessable owner token (32 random bytes) and creates a workspace seeded with a copy of the demo template; only the token's SHA-256 hash is stored server-side (`workspaces`, service role only). The browser keeps the token in localStorage and sends it as `x-owner-token` to the REST API, `mutate` and `jev-classify`. Every data row has an `owner_id`: RLS lets anon SELECT only its own rows and INSERT only its own `transactions`/`questions`; anon has no UPDATE, DELETE or TRUNCATE privilege on any table, and can EXECUTE no function except `current_owner_id()`. Every `mutate` action is filtered by the caller's `owner_id`; "Delete all my data" calls `delete_all_data(p_owner)`, which is `SECURITY DEFINER`, service-role only, and deletes only that owner's rows.
 
 ### Policy
 - **Auto-accept** if confidence >= 0.75 and not `uncertain`. Otherwise → Needs you queue with top 3 options.
@@ -93,7 +94,7 @@ npm run dev
 
 ## Demo data
 
-A seeded demo person "Sam" has ~250 transactions across July–September 2026, with realistic merchants, categories, budgets, and rules. Offline replay runs the real policy and query code with no API calls.
+A seeded demo person "Sam" has ~250 transactions across July–September 2026, with realistic merchants, categories, budgets, and rules. These rows (`owner_id` NULL) are a read-only template: each new workspace gets its own copy, and the template itself is invisible to the browser. Offline replay runs the real policy and query code with no API calls.
 
 ## Limitations
 

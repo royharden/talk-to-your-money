@@ -1,5 +1,5 @@
 import { FunctionsHttpError } from "@supabase/supabase-js";
-import { supabase } from "./supabase";
+import { supabase, getOwnerToken, setOwnerToken } from "./supabase";
 import { Mode, ParsedTransaction } from "./types";
 import { runQuery } from "./queries";
 import { offlineRoute, OFFLINE_TEMPLATES, RECORDED_JEV_RESPONSES } from "./demo";
@@ -28,6 +28,35 @@ async function invokeIngestForm<T>(formData: FormData): Promise<T> {
   }
   if (error) throw error;
   return data as T;
+}
+
+// ── Session (each visitor's own workspace, keyed by an unguessable owner token) ──
+
+let sessionPromise: Promise<void> | null = null;
+
+/**
+ * Make sure this browser has a valid owner token: keep the stored one if the
+ * server still knows it, otherwise ask mutate to create a new workspace.
+ */
+export function ensureSession(): Promise<void> {
+  // One in-flight attempt at a time (StrictMode mounts twice); a failure can be retried
+  sessionPromise ??= startSession().catch((err) => {
+    sessionPromise = null;
+    throw err;
+  });
+  return sessionPromise;
+}
+
+async function startSession(): Promise<void> {
+  if (getOwnerToken()) {
+    const { data, error } = await supabase.rpc("current_owner_id");
+    if (error) throw error;
+    if (data) return;
+    setOwnerToken(null);
+  }
+  const { token } = await invokeFn("mutate", { action: "create_session" });
+  if (typeof token !== "string" || !token) throw new Error("mutate: no session token returned");
+  setOwnerToken(token);
 }
 
 // ── Mutate API (all UPDATE/DELETE/upsert go through the mutate edge function) ──

@@ -5,7 +5,7 @@ import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, X-Owner-Token",
 };
 
 const DEFAULT_DAILY_CAP = 200;
@@ -21,6 +21,8 @@ const MAX_CUSTOM_CATEGORIES = 20;
 const MAX_CUSTOM_CATEGORY_CHARS = 40;
 const MAX_ROUTE_TEXT_CHARS = 500;
 const BATCH_SIZE = 10;
+// Owner token: 32 random bytes, base64url without padding (minted by mutate)
+const OWNER_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 // First attempt + one retry; each retry reserves its own unit
 const MAX_JEV_ATTEMPTS = 2;
 
@@ -178,6 +180,17 @@ function capResponse(cap: { allowed: boolean; error?: string }): Response | null
   if (cap.error) return jsonResponse({ error: cap.error }, 503);
   if (!cap.allowed) return jsonResponse({ error: DAILY_LIMIT_MESSAGE, code: "daily_limit" }, 429);
   return null;
+}
+
+/** The caller's workspace id from the x-owner-token header, or null if missing or unknown */
+async function resolveOwner(supabase: any, req: Request): Promise<string | null> {
+  const token = req.headers.get("x-owner-token");
+  if (!token || !OWNER_TOKEN_RE.test(token)) return null;
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const hash = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  const { data, error } = await supabase.from("workspaces").select("id").eq("token_hash", hash).maybeSingle();
+  if (error) throw error;
+  return data?.id ?? null;
 }
 
 /** Keep custom categories bounded before they reach Jev's choice list */
@@ -378,12 +391,16 @@ Deno.serve(async (req: Request) => {
         throw new HttpError(400, "Invalid transaction");
       }
 
-      // Check rules table — skip Jev for merchants with rules
+      // Check the caller's own rules — skip Jev for merchants with rules
+      const owner = await resolveOwner(supabase, req);
       const merchants = [...new Set(transactions.map((t: any) => t.merchant))];
-      const { data: rules } = await supabase
-        .from("rules")
-        .select("merchant, category")
-        .in("merchant", merchants);
+      const { data: rules } = owner
+        ? await supabase
+            .from("rules")
+            .select("merchant, category")
+            .eq("owner_id", owner)
+            .in("merchant", merchants)
+        : { data: [] };
 
       const ruleMap: Record<string, string> = {};
       for (const r of rules || []) {
