@@ -21,3 +21,19 @@ dist-ssr
 *.sln
 *.sw?
 .env
+
+# Local credentials, archives, and generated files
+.env.*
+!.env.example
+.creds/
+ArchiveManager-creds.txt
+*.pem
+*.key
+*.p12
+*.pfx
+*.zip
+coverage/
+.cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
